@@ -34,20 +34,19 @@ struct march_output {
 
 fn op_smooth_union(d1: f32, d2: f32, col1: vec3f, col2: vec3f, k: f32) -> vec4f
 {
-  var k_eps = max(k, 0.0001);
-  return vec4f(col1, d1);
-}
+  var h = clamp(0.5 + 0.5 * (d2 - d1) / max(k, 0.0001), 0.0, 1.0);
+  return vec4f(mix(col2, col1, h), mix(d2, d1, h) - k * h * (1.0 - h));}
 
 fn op_smooth_subtraction(d1: f32, d2: f32, col1: vec3f, col2: vec3f, k: f32) -> vec4f
 {
-  var k_eps = max(k, 0.0001);
-  return vec4f(col1, d1);
+  var h = clamp(0.5 - 0.5 * (d2 + d1) / max(k, 0.0001), 0.0, 1.0);
+  return vec4f(mix(col2, col1, h), mix(d2, -d1, h) + k * h * (1.0 - h));
 }
 
 fn op_smooth_intersection(d1: f32, d2: f32, col1: vec3f, col2: vec3f, k: f32) -> vec4f
 {
-  var k_eps = max(k, 0.0001);
-  return vec4f(col1, d1);
+  var h = clamp(0.5 - 0.5 * (d2 - d1) / max(k, 0.0001), 0.0, 1.0);
+  return vec4f(mix(col2, col1, h), mix(d2, d1, h) + k * h * (1.0 - h));
 }
 
 fn op(op: f32, d1: f32, d2: f32, col1: vec3f, col2: vec3f, k: f32) -> vec4f
@@ -61,7 +60,7 @@ fn op(op: f32, d1: f32, d2: f32, col1: vec3f, col2: vec3f, k: f32) -> vec4f
   // subtraction
   if (op < 2.0)
   {
-    return op_smooth_subtraction(d2, d1, col2, col1, k);
+    return op_smooth_subtraction(d1, d2, col1, col2, k);
   }
 
   // intersection
@@ -70,7 +69,7 @@ fn op(op: f32, d1: f32, d2: f32, col1: vec3f, col2: vec3f, k: f32) -> vec4f
 
 fn repeat(p: vec3f, offset: vec3f) -> vec3f
 {
-  return vec3f(0.0);
+  return modc(p + offset * 0.5, offset) - offset * 0.5;
 }
 
 fn transform_p(p: vec3f, option: vec2f) -> vec3f
@@ -87,65 +86,117 @@ fn transform_p(p: vec3f, option: vec2f) -> vec3f
 
 fn scene(p: vec3f) -> vec4f // xyz = color, w = distance
 {
-    var d = mix(100.0, p.y, uniforms[17]);
+  //braga, c vc ta lendo isso, existe algum motivo pra voce declarar todas as variaveis como var? mudando porque me incomoda profundamente, mesmo mudando nada
+  let mandelbulb = uniforms[18];
+  let weird_thing = uniforms[19];
+  var d = mix(100.0, p.y, uniforms[17]);
 
-    var spheresCount = i32(uniforms[2]);
-    var boxesCount = i32(uniforms[3]);
-    var torusCount = i32(uniforms[4]);
+  let spheresCount = i32(uniforms[2]);
+  let boxesCount = i32(uniforms[3]);
+  let torusCount = i32(uniforms[4]);
 
-    var all_objects_count = spheresCount + boxesCount + torusCount;
-    var result = vec4f(vec3f(1.0), d);
+  let all_objects_count = spheresCount + boxesCount + torusCount;
+  var result = vec4f(vec3f(1.0), d);
 
-    for (var i = 0; i < all_objects_count; i = i + 1)
+  var c1 : vec3f;
+  var c2 : vec3f;
+  var count = 0;
+  for (var i = 0; i < all_objects_count; i = i + 1)
+  {
+    // get shape and shape order (shapesinfo)
+    let index_ = i32(shapesinfob[i].y);
+    let shape_type = shapesinfob[i].x; 
+    var info = shapesb[index_];
+
+    let p_transform = transform_p( p - info.transform_animated.xyz,info.op.zw);
+    if ( shape_type > 1.0 ) // torus
+    { 
+      d = sdf_torus(p_transform,info.radius.xy,info.quat); 
+    }
+    else if (shape_type > 0.0)// caixa
     {
-      // get shape and shape order (shapesinfo)
-      // shapesinfo has the following format:
-      // x: shape type (0: sphere, 1: box, 2: torus)
-      // y: shape index
-      // order matters for the operations, they're sorted on the CPU side
-
-      // call transform_p and the sdf for the shape
-      // call op function with the shape operation
-
-      // op format:
-      // x: operation (0: union, 1: subtraction, 2: intersection)
-      // y: k value
-      // z: repeat mode (0: normal, 1: repeat)
-      // w: repeat offset
+      d = sdf_round_box(p_transform, info.radius.xyz, info.radius.w, info.quat);
+    } 
+    else  // bola
+    {
+      d = sdf_sphere(p_transform,info.radius,info.quat);
     }
 
-    return result;
+    //desgraca de union sub e sla o q. sim ta ilegivel fazer o que
+    result = op(info.op.x,d,result.w,info.color.xyz,result.xyz,info.op.y);
+  }
+  return result;
 }
 
 fn march(ro: vec3f, rd: vec3f) -> march_output
 {
-  var max_marching_steps = i32(uniforms[5]);
-  var EPSILON = uniforms[23];
+  let outline = uniforms[26];
+  let outline_width = uniforms[27];
+  let max_marching_steps = i32(uniforms[5]);
+  let EPSILON = uniforms[23];
+  let march_step = uniforms[22];
 
   var depth = 0.0;
-  var color = vec3f(0.0);
-  var march_step = uniforms[22];
-  
-  for (var i = 0; i < max_marching_steps; i = i + 1)
+  var distance = 10000.;
+  var min_dist = MAX_DIST;
+  for (var depth = 0.0; depth < f32(MAX_DIST); depth+=distance)
   {
-      // raymarch algorithm
-      // call scene function and march
-      // if the depth is greater than the max distance or the distance is less than the epsilon, break
-  }
+    // call scene function and march
+    let ray_info = scene(ro+rd*depth);
+    distance = ray_info.w;
 
-  return march_output(color, depth, false);
+    if (ray_info.w < min_dist)
+    {
+      min_dist = ray_info.w;
+      if (min_dist < EPSILON ){
+        return march_output(ray_info.xyz,depth,false);
+      }
+    }      
+    // if the depth is greater than the max distance or the distance is less than the epsilon, break
+    else if(depth > MAX_DIST)
+    {
+      break;
+    }
+  }
+  if (outline > 0 && min_dist < outline_width){
+    return march_output(vec3f(0.0), MAX_DIST, true);
+  }
+  return march_output(vec3f(0.0), MAX_DIST, false);
 }
 
 fn get_normal(p: vec3f) -> vec3f
 {
-  return vec3f(0.0);
+  let epsilon = 0.0001;
+  let nx = scene(p + vec3f(epsilon,0,0)).w - scene(p - vec3f(epsilon,0,0)).w;
+  let ny = scene(p + vec3f(0,epsilon,0)).w - scene(p - vec3f(0,epsilon,0)).w;
+  let nz = scene(p + vec3f(0,0,epsilon)).w - scene(p - vec3f(0,0,epsilon)).w;
+  return normalize(vec3f(nx, ny, nz));
+}
+
+//portando do glsl pq nn existe essa bagaca no wgsl
+fn map(ro:vec3f, rd:vec3f, t:f32) -> f32{
+  return scene(ro + rd*t).w;
 }
 
 // https://iquilezles.org/articles/rmshadows/
 fn get_soft_shadow(ro: vec3f, rd: vec3f, tmin: f32, tmax: f32, k: f32) -> f32
 {
-  return 0.0;
+  var res = 1.0;
+  var t = tmin;
+  for( var i=0.; i<256. && t<tmax; i+=1)
+  {
+    let h = map(ro, rd, t);
+    res = min(res, k * h / t);
+    t += clamp(h, 0.005, 0.50);
+    if( res<-1.0 || t>tmax ) { break; }
+  }
+  res = max(res,-1.0);
+  return 0.25*(1.0+res)*(1.0+res)*(2.0-res);
 }
+
+
+
+
 
 fn get_AO(current: vec3f, normal: vec3f) -> f32
 {
@@ -181,26 +232,23 @@ fn get_ambient_light(light_pos: vec3f, sun_color: vec3f, rd: vec3f) -> vec3f
 
 fn get_light(current: vec3f, obj_color: vec3f, rd: vec3f) -> vec3f
 {
-  var light_position = vec3f(uniforms[13], uniforms[14], uniforms[15]);
-  var sun_color = int_to_rgb(i32(uniforms[16]));
-  var ambient = get_ambient_light(light_position, sun_color, rd);
-  var normal = get_normal(current);
-
-  // calculate light based on the normal
-  // if the object is too far away from the light source, return ambient light
-  if (length(current) > uniforms[20] + uniforms[8])
-  {
-    return ambient;
-  }
-
-  // calculate the light intensity
-  // Use:
-  // - shadow
-  // - ambient occlusion (optional)
-  // - ambient light
-  // - object color
-  return ambient;
+  let light_position = vec3f(uniforms[13], uniforms[14], uniforms[15]);
+  let sunlight_color = int_to_rgb(i32(uniforms[16]));
+  let ambient_light = get_ambient_light(light_position, sunlight_color, rd);
+  let surface_normal = get_normal(current);
+  let light_direction = normalize(light_position - current);
+  let diffuse_intensity = max(dot(surface_normal, light_direction), 0.);
+  let epsilon = 0.0001;
+  let shadow_factor = get_soft_shadow(current + surface_normal * epsilon, light_direction, epsilon, length(light_position - current), 32.);
+  let diffuse_lighting = diffuse_intensity * obj_color  * sunlight_color * shadow_factor;
+  let ambient_occlusion = get_AO(current, surface_normal);
+  var final_color = ambient_light * obj_color ;
+  final_color += diffuse_lighting;
+  final_color *= ambient_occlusion;
+  final_color = clamp(final_color, vec3f(0.0), vec3f(1.0));
+  return final_color;
 }
+
 
 fn set_camera(ro: vec3f, ta: vec3f, cr: f32) -> mat3x3<f32>
 {
@@ -211,54 +259,76 @@ fn set_camera(ro: vec3f, ta: vec3f, cr: f32) -> mat3x3<f32>
   return mat3x3<f32>(cu, cv, cw);
 }
 
-fn animate(val: vec3f, time_scale: f32, offset: f32) -> vec3f
-{
-  return vec3f(0.0);
+fn animate(val: vec3f, amplitude: vec3f, speed: f32, time: f32) -> vec3f {
+  return val + amplitude * sin(speed * time);
 }
 
 @compute @workgroup_size(THREAD_COUNT, 1, 1)
-fn preprocess(@builtin(global_invocation_id) id : vec3u)
-{
+fn preprocess(@builtin(global_invocation_id) id : vec3u) {
   var time = uniforms[0];
   var spheresCount = i32(uniforms[2]);
   var boxesCount = i32(uniforms[3]);
   var torusCount = i32(uniforms[4]);
   var all_objects_count = spheresCount + boxesCount + torusCount;
 
-  if (id.x >= u32(all_objects_count))
-  {
+  if (i32(id.x) >= all_objects_count) {
     return;
   }
 
-  // optional: performance boost
-  // Do all the transformations here and store them in the buffer since this is called only once per object and not per pixel
+  let idx = i32(id.x);
+  let shape_info = shapesb[idx];
+
+  // transform
+  let transform_new = animate(shape_info.transform.xyz, shape_info.animate_transform.xyz, shape_info.animate_transform.w, time);
+  shapesb[idx].transform_animated = vec4f(transform_new, shape_info.transform.w);
+
+  // rotation
+  let quaternion = animate(shape_info.rotation.xyz, shape_info.animate_rotation.xyz, shape_info.animate_rotation.w, time);
+  shapesb[idx].quat = quaternion_from_euler(quaternion);
 }
 
 @compute @workgroup_size(THREAD_COUNT, THREAD_COUNT, 1)
-fn render(@builtin(global_invocation_id) id : vec3u)
+fn render(@builtin(global_invocation_id) id: vec3u)
 {
-  // unpack data
-  var fragCoord = vec2f(f32(id.x), f32(id.y));
-  var rez = vec2(uniforms[1]);
-  var time = uniforms[0];
+  // Unpack data
+  let fragCoord = vec2f(f32(id.x), f32(id.y));
+  let rez = vec2f(uniforms[1]);
+  let time = uniforms[0];
+  let outline_color = uniforms[28];
 
-  // camera setup
-  var lookfrom = vec3(uniforms[6], uniforms[7], uniforms[8]);
-  var lookat = vec3(uniforms[9], uniforms[10], uniforms[11]);
-  var camera = set_camera(lookfrom, lookat, 0.0);
-  var ro = lookfrom;
+  // Camera setup
+  let lookfrom = vec3f(uniforms[6], uniforms[7], uniforms[8]);
+  let lookat = vec3f(uniforms[9], uniforms[10], uniforms[11]);
+  let camera = set_camera(lookfrom, lookat, 0.0);
+  let ro = lookfrom;
 
-  // get ray direction
+  // Get ray direction
   var uv = (fragCoord - 0.5 * rez) / rez.y;
   uv.y = -uv.y;
-  var rd = camera * normalize(vec3(uv, 1.0));
+  let rd = camera * normalize(vec3f(uv, 1.0));
 
-  // call march function and get the color/depth
-  // move ray based on the depth
-  // get light
-  var color = vec3f(1.0);
+  // Call march function and get the color/depth
+  let m_out = march(ro, rd);
+  let depth = m_out.depth;
+
+  var final_color : vec3f;
+  if (depth < MAX_DIST){
+    let obj_color = get_light(ro + rd * depth, m_out.color, rd);
+    final_color = linear_to_gamma(obj_color);
+    fb[mapfb(id.xy, uniforms[1])] = vec4f(final_color, 1.0);
+    return;
+  }
   
-  // display the result
-  color = linear_to_gamma(color);
-  fb[mapfb(id.xy, uniforms[1])] = vec4(color, 1.0);
+  else {
+    let light_position = vec3f(uniforms[13], uniforms[14], uniforms[15]);
+    let sun_color = int_to_rgb(i32(uniforms[16]));
+    let ambient_color = get_ambient_light(light_position, sun_color, rd);
+    final_color = linear_to_gamma(ambient_color);
+  }
+
+  if (m_out.outline){
+    final_color = linear_to_gamma(vec3f(outline_color));
+  }
+
+  fb[mapfb(id.xy, uniforms[1])] = vec4f(final_color, 1.0);
 }
